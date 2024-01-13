@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-pragma solidity ^0.8.19;
+pragma solidity ^0.8.20;
 
 // Chainlink
 import {VRFCoordinatorV2Interface} from "@chainlink/contracts/src/v0.8/interfaces/VRFCoordinatorV2Interface.sol";
@@ -49,10 +49,16 @@ contract TokenRumble is VRFConsumerBaseV2, AccessControl {
     // Chainlink VRF
     ChainlinkVRFConfig private s_vrfConfig;
 
+    // Rumbles
     uint256 public s_rumbleCount;
     mapping(uint256 rumbleId => Rumble rumble) private s_rumbleAtId;
     mapping(uint256 requestId => uint256 rumbleId)
         private s_rumbleIdAtRequestId;
+    mapping(uint256 rumbleId => uint256 activeRumbleIndex)
+        private s_activeRumbleIndexAtId;
+    uint256[] private s_activeRumbleIds;
+    uint256[] private s_closedRumbleIds;
+    address[] private s_winners;
 
     ///////////////////
     // Events
@@ -90,7 +96,7 @@ contract TokenRumble is VRFConsumerBaseV2, AccessControl {
     ///////////////////
 
     modifier RumbleExists(uint256 _rumbleId) {
-        if (_rumbleId >= s_rumbleCount) {
+        if (_rumbleId > s_rumbleCount || _rumbleId == 0) {
             revert TokenRumble__RumbleNotFound();
         }
         _;
@@ -131,32 +137,31 @@ contract TokenRumble is VRFConsumerBaseV2, AccessControl {
         uint64 _duration
     ) external {
         if (
+            _rewardAmount < _maxNumOfParticipants ||
             _rewardAmount <= 0 ||
             _maxNumOfParticipants <= 0 ||
-            _duration <= 0 ||
-            _rewardAmount < _maxNumOfParticipants
+            _duration <= 0
         ) {
             revert TokenRumble__IncorrectRumbleData();
         }
-
-        address[] memory participants;
 
         Rumble memory rumble = Rumble({
             rewardAmount: _rewardAmount,
             entryFee: _rewardAmount / _maxNumOfParticipants,
             maxNumOfParticipants: _maxNumOfParticipants,
-            participants: participants,
+            participants: new address[](0),
             winner: address(0),
             duration: _duration,
             startTime: uint64(block.timestamp),
             closed: false
         });
 
-        s_rumbleAtId[s_rumbleCount] = rumble;
-        s_rumbleCount++;
+        s_rumbleAtId[++s_rumbleCount] = rumble;
+        s_activeRumbleIndexAtId[s_rumbleCount] = s_activeRumbleIds.length;
+        s_activeRumbleIds.push(s_rumbleCount);
 
         emit RumbleCreated(
-            s_rumbleCount - 1,
+            s_rumbleCount,
             rumble.rewardAmount,
             rumble.entryFee,
             rumble.maxNumOfParticipants,
@@ -169,14 +174,14 @@ contract TokenRumble is VRFConsumerBaseV2, AccessControl {
         uint256 _rumbleId
     ) external payable RumbleExists(_rumbleId) RumbleNotClosed(_rumbleId) {
         Rumble storage rumble = s_rumbleAtId[_rumbleId];
-        if (msg.value < s_rumbleAtId[_rumbleId].entryFee) {
+        if (msg.value < rumble.entryFee) {
             revert TokenRumble__NotEnoughValueSent();
         }
         if (rumble.participants.length + 1 <= rumble.maxNumOfParticipants) {
             rumble.participants.push(msg.sender);
             emit RumbleEntered(_rumbleId, msg.sender, rumble.entryFee);
             if (rumble.participants.length == rumble.maxNumOfParticipants) {
-                rumble.closed = true;
+                _closeRumble(_rumbleId);
                 _drawWinner(_rumbleId);
             }
         }
@@ -186,12 +191,33 @@ contract TokenRumble is VRFConsumerBaseV2, AccessControl {
         uint256 _rumbleId
     ) external RumbleExists(_rumbleId) RumbleNotClosed(_rumbleId) {
         Rumble storage rumble = s_rumbleAtId[_rumbleId];
+
         if (rumble.startTime + rumble.duration > block.timestamp) {
             revert TokenRumble__RumbleStillRunning();
         }
-        rumble.closed = true;
+
+        // If Rumble not full, recompute reward amount
         rumble.rewardAmount = rumble.entryFee * rumble.participants.length;
+
+        _closeRumble(_rumbleId);
         _drawWinner(_rumbleId);
+    }
+
+    function _closeRumble(uint256 _rumbleId) internal {
+        Rumble storage rumble = s_rumbleAtId[_rumbleId];
+        rumble.closed = true;
+        uint256 rumbleIndex = s_activeRumbleIndexAtId[_rumbleId];
+        uint256 lastIndex = s_activeRumbleIds.length - 1;
+
+        if (rumbleIndex != lastIndex) {
+            uint256 lastRumbleId = s_activeRumbleIds[lastIndex];
+            s_activeRumbleIds[rumbleIndex] = lastRumbleId;
+            s_activeRumbleIndexAtId[lastRumbleId] = rumbleIndex;
+        }
+
+        s_activeRumbleIds.pop();
+        delete s_activeRumbleIndexAtId[_rumbleId];
+        s_closedRumbleIds.push(_rumbleId);
     }
 
     function _drawWinner(uint256 _rumbleId) internal {
@@ -214,6 +240,7 @@ contract TokenRumble is VRFConsumerBaseV2, AccessControl {
         uint256 winnerIndex = randomWords[0] % rumble.participants.length;
         address winner = rumble.participants[winnerIndex];
         rumble.winner = winner;
+        s_winners.push(winner);
         (bool success, ) = winner.call{value: rumble.rewardAmount}("");
         if (!success) {
             revert TokenRumble__TransferToWinnerFailed();
@@ -271,5 +298,17 @@ contract TokenRumble is VRFConsumerBaseV2, AccessControl {
         uint256 _rumbleId
     ) external view returns (address winner) {
         return s_rumbleAtId[_rumbleId].winner;
+    }
+
+    function getActiveRumbleIds() external view returns (uint256[] memory) {
+        return s_activeRumbleIds;
+    }
+
+    function getClosedRumbleIds() external view returns (uint256[] memory) {
+        return s_closedRumbleIds;
+    }
+
+    function getWinners() external view returns (address[] memory) {
+        return s_winners;
     }
 }
